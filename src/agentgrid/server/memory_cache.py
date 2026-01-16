@@ -133,7 +133,10 @@ class MemoryCache:
     @property
     def bytes_left(self) -> int:
         with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-            total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+            # Note: _pooled_size_bytes is NOT counted as "used" because those tensors are
+            # in the free pool and available for immediate reuse. Only active allocations
+            # (current_size_bytes) and pending allocations (enqueued_size_bytes) count as used.
+            total_used = self.current_size_bytes + self.enqueued_size_bytes
             # Account for reserved overhead in the calculation
             return max(0, self.max_size_bytes - total_used - self._reserved_overhead_bytes)
 
@@ -170,6 +173,12 @@ class MemoryCache:
     def _get_cuda_memory_info(self, device: torch.device) -> Tuple[int, int]:
         """Get actual CUDA memory info (free, total) for a device."""
         if device.type == "cuda":
+            # Skip CUDA memory check if we're in the runtime subprocess (after fork)
+            # CUDA cannot be accessed after fork, but that's OK - the ConnectionHandler
+            # process does the actual CUDA memory checking for backpressure
+            if os.getpid() != self.runtime_pid:
+                return (2**64 - 1, 2**64 - 1)
+
             try:
                 free_bytes, total_bytes = torch.cuda.mem_get_info(device.index or 0)
                 self._cuda_memory_limits[device] = (free_bytes, total_bytes)
@@ -280,7 +289,8 @@ class MemoryCache:
             # Only clear device caches if we collected objects or being aggressive
             if collected > 0 or aggressive:
                 # Clear CUDA cache if available with device-specific clearing
-                if torch.cuda.is_available():
+                # Skip if we're in the runtime subprocess (CUDA cannot be accessed after fork)
+                if torch.cuda.is_available() and os.getpid() == self.runtime_pid:
                     # Clear cache for all CUDA devices
                     for device_id in range(torch.cuda.device_count()):
                         with torch.cuda.device(device_id):
@@ -330,8 +340,10 @@ class MemoryCache:
         :param required_bytes: Amount of memory needed for allocation
         :param device: Optional device to check memory for
         """
-        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-            total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+        # Note: _pooled_size_bytes represents free pool tensors available for reuse,
+        # so it should NOT be counted as "used" for budget checking
+        with self._enqueued_size.get_lock():
+            total_used = self.current_size_bytes + self.enqueued_size_bytes
 
         # Check actual CUDA memory availability
         if device is not None and device.type == "cuda":
@@ -370,8 +382,9 @@ class MemoryCache:
                     self.force_garbage_collection()
 
             # Check if we still don't have enough memory after eviction
-            with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-                total_used_after = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+            # Note: _pooled_size_bytes is not counted as used (tensors available for reuse)
+            with self._enqueued_size.get_lock():
+                total_used_after = self.current_size_bytes + self.enqueued_size_bytes
 
             if total_used_after + required_bytes > self.max_size_bytes:
                 logger.warning(f"Still insufficient memory after eviction: need {required_bytes / 1024**2:.2f} MB, available {(self.max_size_bytes - total_used_after) / 1024**2:.2f} MB")
@@ -496,14 +509,16 @@ class MemoryCache:
             context_manager = async_timeout.timeout(timeout) if timeout != 0 else contextlib.AsyncExitStack()
             # contextlib.AsyncExitStack() is used as a null context here
             async with context_manager:
-                with self._pooled_size_bytes.get_lock():
-                    total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+                # Note: _pooled_size_bytes represents free pool tensors available for reuse,
+                # so only count current_size_bytes (active allocations) and enqueued_size_bytes
+                with self._enqueued_size.get_lock():
+                    total_size = self.current_size_bytes + self.enqueued_size_bytes
                 if timeout == 0 and total_size > self.max_size_bytes:
                     raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
 
                 async with enter_asynchronously(self._lock_acquire_memory):
-                    with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-                        current_total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+                    with self._enqueued_size.get_lock():
+                        current_total_size = self.current_size_bytes + self.enqueued_size_bytes
                     if current_total_size + alloc_size > self.max_size_bytes:
                         if timeout == 0:
                             raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
@@ -542,8 +557,9 @@ class MemoryCache:
         timeout = timeout if timeout != float("inf") else None
         deadline = None if timeout is None else time.perf_counter() + timeout
         while True:
-            with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-                current_total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+            # Note: _pooled_size_bytes is not counted as used (tensors available for reuse)
+            with self._enqueued_size.get_lock():
+                current_total_size = self.current_size_bytes + self.enqueued_size_bytes
             if current_total_size + allocated_size <= self.max_size_bytes:
                 break
 
@@ -624,8 +640,9 @@ class MemoryCache:
 
     def _get_memory_pressure(self) -> float:
         """Get current memory pressure as a ratio of used/max memory."""
-        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-            total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+        # Note: _pooled_size_bytes is not counted as pressure (tensors available for reuse)
+        with self._enqueued_size.get_lock():
+            total_used = self.current_size_bytes + self.enqueued_size_bytes
         return total_used / self.max_size_bytes if self.max_size_bytes != 2**64 - 1 else 0.0
 
     def _calculate_adaptive_interval(self) -> int:
@@ -771,8 +788,9 @@ class MemoryCache:
                 logger.debug(f"Periodic GC collected {collected} objects")
 
         # Step 2: Evict memory if cache is over budget
-        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-            total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+        # Note: _pooled_size_bytes is not counted as "over budget" since those tensors are reusable
+        with self._enqueued_size.get_lock():
+            total_size = self.current_size_bytes + self.enqueued_size_bytes
 
         if self.max_size_bytes == 2**64 - 1:
             should_evict = False
@@ -967,12 +985,18 @@ class MemoryCache:
         if current_time - self._last_monitoring_log >= self._monitoring_interval:
             gib = 1024**3
             with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-                total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
-                memory_pressure = total_used / self.max_size_bytes if self.max_size_bytes != 2**64 - 1 else 0.0
+                active_used = self.current_size_bytes
+                pooled_free = self._pooled_size_bytes.value
+                enqueued = self.enqueued_size_bytes
+                # Note: For memory pressure calculation, we only count active allocations
+                # since pooled tensors are available for immediate reuse
+                memory_pressure = active_used / self.max_size_bytes if self.max_size_bytes != 2**64 - 1 else 0.0
 
             logger.info(
                 f"Memory Cache Stats - "
-                f"Used: {total_used / gib:.2f} GiB ({memory_pressure * 100:.1f}%), "
+                f"Active: {active_used / gib:.2f} GiB ({memory_pressure * 100:.1f}%), "
+                f"Pooled (reusable): {pooled_free / gib:.2f} GiB, "
+                f"Enqueued: {enqueued / gib:.2f} GiB, "
                 f"Available: {self.bytes_left / gib:.2f} GiB, "
                 f"Allocations: {self._allocation_count}, "
                 f"Evictions: {self._eviction_count}, "
