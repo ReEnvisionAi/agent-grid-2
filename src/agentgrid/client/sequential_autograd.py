@@ -30,7 +30,21 @@ from agentgrid.utils.packaging import pack_args_kwargs
 
 logger = get_logger(__name__)
 
-MAX_TOKENS_IN_BATCH = 1024
+MAX_TOKENS_IN_BATCH = 4096  # 4x increase from 1024 for better throughput
+
+
+def get_optimal_batch_size(sequence_length: int, available_memory_gb: float = 80) -> int:
+    """Calculate optimal batch size based on sequence length and available memory."""
+    base_batch = MAX_TOKENS_IN_BATCH
+    # Reduce batch size for longer sequences to prevent OOM
+    if sequence_length > 4096:
+        base_batch = base_batch // 2
+    elif sequence_length > 8192:
+        base_batch = base_batch // 4
+    # Further reduce for low-memory systems
+    if available_memory_gb < 20:
+        base_batch = min(base_batch, 512)
+    return max(128, base_batch)
 
 
 async def sequential_forward(
@@ -54,13 +68,14 @@ async def sequential_forward(
 
     inputs_device = inputs.device
     inputs_dtype = inputs.dtype
-    inputs = inputs.cpu()
-    prompts = prompts.cpu()
-    attention_mask = attention_mask.cpu()
-    position_ids = position_ids.cpu()
+    # Keep tensors on GPU - RPC serialization handles optimization efficiently
+    inputs = inputs.detach()
+    prompts = prompts.detach() if prompts is not None else prompts
+    attention_mask = attention_mask.detach()
+    position_ids = position_ids.detach()
     cos, sin = position_embeddings
-    cos = cos.cpu().detach()
-    sin = sin.cpu().detach()
+    cos = cos.detach()
+    sin = sin.detach()
     position_embeddings = (cos, sin)
 
     end_index = end_index if end_index is not None else len(sequence_manager.block_uids)
@@ -125,8 +140,8 @@ async def sequential_forward(
                 maybe_log_traceback(e)
                 await asyncio.sleep(delay)
 
-    outputs = inputs.to(device=inputs_device, dtype=inputs_dtype)
-    intermediate_inputs = [tensor.to(device=inputs_device, dtype=inputs_dtype) for tensor in intermediate_inputs]
+    outputs = inputs if inputs.device == inputs_device else inputs.to(device=inputs_device, dtype=inputs_dtype)
+    intermediate_inputs = [t if t.device == inputs_device else t.to(device=inputs_device, dtype=inputs_dtype) for t in intermediate_inputs]
     return outputs, intermediate_inputs, done_sequences
 
 
@@ -148,9 +163,10 @@ async def sequential_backward(
     prompts_device = prompts.device
     prompts_dtype = prompts.dtype
 
-    grad_outputs = [tensor.cpu() for tensor in grad_outputs]
-    intermediate_inputs = [tensor.cpu() for tensor in intermediate_inputs]
-    prompts = prompts.cpu()
+    # Keep tensors on GPU - RPC serialization handles optimization efficiently
+    grad_outputs = [tensor.detach() for tensor in grad_outputs]
+    intermediate_inputs = [tensor.detach() for tensor in intermediate_inputs]
+    prompts = prompts.detach()
 
     grad_prompts_reversed = []
     while len(forward_sequences) > 0 and len(intermediate_inputs) > 0:
@@ -210,9 +226,9 @@ async def sequential_backward(
     grad_prompts = torch.cat(grad_prompts_reversed[::-1], dim=0) if grad_prompts_reversed else None
 
     if grad_outputs_dtype is not None:
-        grad_outputs = [tensor.to(device=grad_outputs_device, dtype=grad_outputs_dtype) for tensor in grad_outputs]
+        grad_outputs = [t if t.device == grad_outputs_device else t.to(device=grad_outputs_device, dtype=grad_outputs_dtype) for t in grad_outputs]
     if grad_prompts is not None:
-        grad_prompts = grad_prompts.to(device=prompts_device, dtype=prompts_dtype)
+        grad_prompts = grad_prompts if grad_prompts.device == prompts_device else grad_prompts.to(device=prompts_device, dtype=prompts_dtype)
     return grad_outputs, grad_prompts
 
 

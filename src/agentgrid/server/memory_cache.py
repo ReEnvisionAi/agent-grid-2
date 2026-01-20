@@ -84,8 +84,13 @@ class MemoryCache:
         # Backpressure threshold - when to start rejecting requests
         self._backpressure_threshold = 0.85  # 85% of allocatable memory
 
-        # Per-device CUDA memory limits (cached)
-        self._cuda_memory_limits: Dict[torch.device, Tuple[int, int]] = {}  # device -> (free, total)
+        # Per-device CUDA memory limits (shared via Manager for access across forked processes)
+        self._manager = mp.Manager()
+        self._cuda_memory_limits = self._manager.dict()  # device -> (free, total)
+
+        # Eviction request tracking for pipe-based architecture
+        self._eviction_request_counter = mp.Value(ctypes.c_int64, 0, lock=False)
+        self._pending_evictions = self._manager.dict()  # request_id -> {"bytes_requested": int, "timestamp": float}
 
         # Initialize CUDA memory pool optimizations
         self._initialize_cuda_memory_pools()
@@ -178,16 +183,48 @@ class MemoryCache:
             except Exception as e:
                 logger.warning(f"Failed to initialize CUDA memory pools: {e}")
 
+    def _is_runtime_process(self) -> bool:
+        """Check if we're in the runtime process (not a forked subprocess)."""
+        return os.getpid() == self.runtime_pid
+
+    def _log_prefix(self) -> str:
+        """Return a prefix for log messages identifying the process type and PID."""
+        pid = os.getpid()
+        if self._is_runtime_process():
+            return f"[Runtime PID:{pid}]"
+        else:
+            return f"[Handler PID:{pid}]"
+
     def _get_cuda_memory_info(self, device: torch.device) -> Tuple[int, int]:
-        """Get actual CUDA memory info (free, total) for a device."""
-        if device.type == "cuda":
-            try:
-                free_bytes, total_bytes = torch.cuda.mem_get_info(device.index or 0)
-                self._cuda_memory_limits[device] = (free_bytes, total_bytes)
-                return free_bytes, total_bytes
-            except Exception as e:
-                logger.warning(f"Failed to get CUDA memory info for {device}: {e}")
-        return (2**64 - 1, 2**64 - 1)  # Fallback to unlimited
+        """Get actual CUDA memory info (free, total) for a device.
+
+        In forked subprocesses, CUDA cannot be re-initialized, so we use cached values
+        from the runtime process. Returns (0, 0) if no cached value is available, which
+        will trigger safe backpressure behavior.
+        """
+        if device.type != "cuda":
+            return (2**64 - 1, 2**64 - 1)
+
+        # Use string key for shared dict (torch.device is not easily shareable)
+        device_key = str(device)
+
+        # In forked subprocesses, use cached values from shared dict
+        if not self._is_runtime_process():
+            if device_key in self._cuda_memory_limits:
+                return self._cuda_memory_limits[device_key]
+            # No cached value available - return 0 to trigger safe backpressure/failure
+            # This is better than returning unlimited which could cause OOM
+            logger.debug(f"No cached CUDA memory info for {device} in forked process")
+            return (0, 0)
+
+        # Only in runtime process - actually query CUDA and cache the result
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device.index or 0)
+            self._cuda_memory_limits[device_key] = (free_bytes, total_bytes)
+            return free_bytes, total_bytes
+        except Exception as e:
+            logger.warning(f"Failed to get CUDA memory info for {device}: {e}")
+            return (0, 0)  # Return 0 on error to trigger safe backpressure
 
     def _update_reserved_memory(self):
         """Update reserved memory based on model weights and overhead."""
@@ -361,8 +398,8 @@ class MemoryCache:
                     required_bytes + self._reserved_overhead_bytes,
                 )
                 if bytes_to_evict > 0:
-                    logger.info(f"Backpressure evicting {bytes_to_evict / 1024**2:.2f} MB")
-                    self._evict_memory(bytes_to_evict)
+                    logger.info(f"Backpressure evicting {bytes_to_evict / 1024**2:.2f} MB (via pipe)")
+                    self._request_eviction(bytes_to_evict)
                     self.force_garbage_collection(aggressive=True)
 
         # Original accounting-based check
@@ -373,8 +410,8 @@ class MemoryCache:
             bytes_to_evict = min(self._pooled_size_bytes.value, memory_shortfall + buffer)
 
             if bytes_to_evict > 0:
-                logger.info(f"Proactively evicting {bytes_to_evict / 1024**2:.2f} MB for {required_bytes / 1024**2:.2f} MB allocation")
-                self._evict_memory(bytes_to_evict)
+                logger.info(f"Proactively evicting {bytes_to_evict / 1024**2:.2f} MB for {required_bytes / 1024**2:.2f} MB allocation (via pipe)")
+                self._request_eviction(bytes_to_evict)
 
                 # Only force garbage collection after eviction if significant memory was freed
                 if bytes_to_evict > 100 * 1024 * 1024:  # Only if >100MB evicted
@@ -386,6 +423,44 @@ class MemoryCache:
 
             if total_used_after + required_bytes > self.max_size_bytes:
                 logger.warning(f"Still insufficient memory after eviction: need {required_bytes / 1024**2:.2f} MB, available {(self.max_size_bytes - total_used_after) / 1024**2:.2f} MB")
+
+    def _request_eviction(self, bytes_to_free: int) -> None:
+        """
+        Send an eviction request to the runtime process via the pipe.
+        This method should ONLY be called from ConnectionHandler processes.
+        The runtime process will handle the actual eviction.
+        """
+        assert not self._is_runtime_process(), "_request_eviction must be called from ConnectionHandler, not runtime"
+
+        # Generate unique request ID
+        with self._eviction_request_counter.get_lock():
+            request_id = int(self._eviction_request_counter.value)
+            self._eviction_request_counter.value += 1
+
+        # Record the request in shared state
+        self._pending_evictions[request_id] = {
+            "bytes_requested": bytes_to_free,
+            "timestamp": time.time()
+        }
+
+        logger.info(
+            f"{self._log_prefix()} Sending eviction request #{request_id}: "
+            f"{bytes_to_free / 1024**2:.2f} MB via pipe"
+        )
+
+        # Send eviction request via pipe
+        with self._lock_metadata:
+            self._pipe_send.send((
+                None,
+                None,
+                {
+                    "command": "evict",
+                    "bytes_to_free": bytes_to_free,
+                    "request_id": request_id
+                }
+            ))
+
+        logger.debug(f"{self._log_prefix()} Eviction request #{request_id} sent to runtime")
 
     def end_session(self, session_id: str):
         """
@@ -571,47 +646,63 @@ class MemoryCache:
             self._memory_freed_event.clear()
 
     def _evict_memory(self, bytes_to_free: int):
-        """Evicts tensors from free pools in Global LRU order until at least `bytes_to_free` are freed."""
+        """Evicts tensors from free pools in Global LRU order until at least `bytes_to_free` are freed.
+
+        NOTE: This should ONLY be called from the runtime process (via use_cache).
+        When called from ConnectionHandler processes, it only affects the local copy
+        of the pools and won't actually free memory in the runtime process.
+        """
+        assert self._is_runtime_process(), (
+            f"_evict_memory must be called from runtime process, "
+            f"but current PID is {os.getpid()} (runtime PID is {self.runtime_pid}). "
+            f"Use _request_eviction() from ConnectionHandlers instead."
+        )
+
+        logger.debug(
+            f"{self._log_prefix()} Starting eviction: need to free "
+            f"{bytes_to_free / 1024**2:.2f} MB"
+        )
+
         bytes_freed = 0
-        
+
         # [IMPROVEMENT 1] Use global LRU keys to decide what to evict next
         # Iterate over a copy because we might modify the map
         for lru_key in list(self._lru_keys.keys()):
             if bytes_freed >= bytes_to_free:
                 break
-                
+
             device, dtype, numel = lru_key
-            
+
             # Check if this specific pool exists
             device_pools = self._free_pools.get(device)
             if not device_pools:
                 self._lru_keys.pop(lru_key, None)
                 continue
-                
+
             dtype_pools = device_pools.get(dtype)
             if not dtype_pools:
                 self._lru_keys.pop(lru_key, None)
                 continue
-                
+
             pool = dtype_pools.get(numel)
             if not pool:
                 self._lru_keys.pop(lru_key, None)
                 continue
-            
+
             # Evict from this specific pool
             # We pop multiple if needed, but at least one to make progress on this LRU bucket
             while pool and bytes_freed < bytes_to_free:
-                tensor = pool.pop(0) # Pop from start (oldest in this bucket) or end? 
+                tensor = pool.pop(0) # Pop from start (oldest in this bucket) or end?
                 # Actually, pool is appended to. So pool.pop(0) is oldest.
-                # But wait, we usually use pop() (newest) for reuse. 
+                # But wait, we usually use pop() (newest) for reuse.
                 # For eviction, we want oldest. So pop(0).
-                
+
                 tensor_size = tensor.numel() * get_size_in_bytes(tensor.dtype)
                 with self._pooled_size_bytes.get_lock():
                     self._pooled_size_bytes.value -= tensor_size
                 bytes_freed += tensor_size
                 del tensor  # Let python GC reclaim memory
-            
+
             # If pool is now empty, remove it from structures
             if not pool:
                 del dtype_pools[numel]
@@ -620,11 +711,18 @@ class MemoryCache:
         if bytes_freed > 0:
             self._memory_freed_event.set()
             self._eviction_count += 1
-        
+
         if bytes_freed < bytes_to_free:
-            logger.debug(f"Warning: requested to evict {bytes_to_free} bytes but could only evict {bytes_freed} bytes.")
-            
-        logger.debug(f"Evicted {bytes_freed / 1024**2:.2f} MB from memory cache pools.")
+            logger.warning(
+                f"{self._log_prefix()} Requested to evict {bytes_to_free / 1024**2:.2f} MB "
+                f"but could only evict {bytes_freed / 1024**2:.2f} MB"
+            )
+
+        if bytes_freed > 0:
+            logger.info(
+                f"{self._log_prefix()} Evicted {bytes_freed / 1024**2:.2f} MB "
+                f"(requested: {bytes_to_free / 1024**2:.2f} MB)"
+            )
 
     def _needs_compaction(self) -> bool:
         """Check if any pools have enough tensors to warrant compaction."""
@@ -639,17 +737,17 @@ class MemoryCache:
         """Calculate a fragmentation score based on pool distribution."""
         total_tensors = 0
         total_pools = 0
-        
+
         for device_pools in self._free_pools.values():
             for dtype_pools in device_pools.values():
                 for pool in dtype_pools.values():
                     if pool:  # Only count non-empty pools
                         total_tensors += len(pool)
                         total_pools += 1
-        
+
         if total_pools == 0:
             return 0.0
-        
+
         # Higher score means more fragmentation (many small pools)
         return total_pools / max(1, total_tensors)
 
@@ -705,30 +803,30 @@ class MemoryCache:
             logger.debug("Skipping compaction - no pools need compaction")
             self._last_compaction_found_work = False
             return
-        
+
         logger.debug("Running memory pool compaction...")
         compaction_work_done = False
-        
+
         for device, device_pools in self._free_pools.items():
             for dtype, dtype_pools in device_pools.items():
                 # Find the bucket with the most tensors (candidate for compaction)
                 # We iterate over a copy of keys since we might modify the dictionary
                 for numel, pool in list(dtype_pools.items()):
                     if len(pool) >= self.COMPACTION_THRESHOLD:
-                        
+
                         # [IMPROVEMENT 2] Smart Compaction Check
                         # Check if the target merged size (2 * numel) is actually useful
                         target_size = 2 * numel
                         if target_size not in self._requested_sizes:
-                            # Skip compacting this pool because the resulting tensors 
+                            # Skip compacting this pool because the resulting tensors
                             # have never been requested by the model
                             continue
-                            
+
                         logger.debug(
                             f"Compacting pool on {device}:{dtype} with {len(pool)} tensors of size {numel}"
                         )
                         initial_pool_size = len(pool)
-                        
+
                         while len(pool) >= 2:
                             t1 = pool.pop()
                             t2 = pool.pop()
@@ -749,14 +847,14 @@ class MemoryCache:
                             new_pool = dtype_pools.setdefault(new_numel, [])
                             new_pool.append(new_tensor)
                             dtype_pools.move_to_end(new_numel)
-                            
+
                             # Update LRU for the new bucket
                             self._lru_keys[(device, dtype, new_numel)] = None
-                            
+
                             compaction_work_done = True
-                        
+
                         logger.debug(f"Compaction finished for pool. Size: {initial_pool_size} -> {len(pool)}")
-        
+
         self._last_compaction_found_work = compaction_work_done
         if compaction_work_done:
             logger.debug("Memory pool compaction completed with work done")
@@ -783,6 +881,7 @@ class MemoryCache:
 
                 # Attempt to find and reserve a tensor from free pools
                 numel = next_descriptor.numel()
+
                 device_pools = self._free_pools.get(next_descriptor.device)
                 if device_pools:
                     dtype_pools = device_pools.get(next_descriptor.dtype)
@@ -832,6 +931,50 @@ class MemoryCache:
             message = self._pipe_recv.recv()
             recv_handles, recv_data, command_info = message if len(message) == 3 else (message[0], message[1], None)
 
+            # Debug: log all message types for trace diagnostics
+            msg_type = "unknown"
+            if command_info:
+                if command_info.get("command") == "evict":
+                    msg_type = f"evict req #{command_info.get('request_id')}"
+                elif command_info.get("command") == "end_session":
+                    msg_type = f"end_session {command_info.get('session_id')}"
+                elif command_info.get("session_id"):
+                    msg_type = f"allocation for session {command_info.get('session_id')}"
+            elif recv_data is not None:
+                msg_type = f"allocation ({len(recv_data)} tensors)"
+            elif recv_handles is not None:
+                msg_type = f"free ({len(recv_handles)} handles)"
+
+            logger.debug(f"{self._log_prefix()} Pipe message: {msg_type}")
+
+            # PRIORITY 1: Handle eviction requests immediately
+            if command_info and command_info.get("command") == "evict":
+                request_id = command_info.get("request_id")
+                bytes_to_free = command_info.get("bytes_to_free", 0)
+
+                logger.info(
+                    f"{self._log_prefix()} Received eviction request #{request_id}: "
+                    f"{bytes_to_free / 1024**2:.2f} MB"
+                )
+
+                if bytes_to_free > 0:
+                    start_time = time.time()
+                    self._evict_memory(bytes_to_free)
+                    elapsed = time.time() - start_time
+
+                    logger.info(
+                        f"{self._log_prefix()} Completed eviction request #{request_id}: "
+                        f"processed in {elapsed*1000:.1f}ms"
+                    )
+
+                # Remove from pending evictions to signal completion
+                if request_id is not None and request_id in self._pending_evictions:
+                    del self._pending_evictions[request_id]
+
+                # Continue to next message immediately
+                continue
+
+            # PRIORITY 2: Handle end_session commands
             if command_info and command_info.get("command") == "end_session":
                 session_id = command_info["session_id"]
                 if session_id in self._active_sessions:
@@ -839,13 +982,13 @@ class MemoryCache:
                     patterns = self._session_patterns.setdefault(session_id, [])
                     patterns.append(history)
                     logger.debug(f"Ended session {session_id}, stored allocation pattern with {len(history)} steps.")
-                
+
                 # Clean up any active handles associated with this session to prevent leaks
                 if session_id in self._session_handles:
                     session_handles = self._session_handles.pop(session_id)
                     # Filter for handles that are still allocated
                     handles_to_free = [h for h in session_handles if h in self._allocated_tensors]
-                    
+
                     if handles_to_free:
                         logger.debug(f"End session {session_id}: cleaning up {len(handles_to_free)} leaked handles")
                         # Reuse the free logic
@@ -859,7 +1002,7 @@ class MemoryCache:
                             numel_pool = dtype_pool.setdefault(numel, [])
                             numel_pool.append(tensor)
                             dtype_pool.move_to_end(numel)
-                            
+
                             # [IMPROVEMENT 1] Update LRU
                             self._lru_keys[(descr.device, descr.dtype, numel)] = None
 
@@ -877,6 +1020,9 @@ class MemoryCache:
                         numel_pool.append(tensor)
                     self._pre_allocation_timestamps.pop(session_id, None)
 
+                continue
+
+            # PRIORITY 3: Handle allocation requests (recv_data is not None)
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
                 session_id = command_info.get("session_id") if command_info else None
@@ -913,7 +1059,7 @@ class MemoryCache:
                             if dtype_pools and numel in dtype_pools and dtype_pools[numel]:
                                 reused_tensor = dtype_pools[numel].pop()
                                 dtype_pools.move_to_end(numel)
-                                
+
                                 # [IMPROVEMENT 1] Update LRU (refresh usage)
                                 self._lru_keys.move_to_end((descr.device, descr.dtype, numel))
 
@@ -932,7 +1078,10 @@ class MemoryCache:
                 if session_id: # After fulfilling request, try to predict and pre-allocate the next one
                     self._predict_and_preallocate(session_id)
 
-            elif recv_handles is not None:  # delete tensors by handle
+                continue
+
+            # PRIORITY 4: Handle free requests (recv_handles is not None, recv_data is None)
+            if recv_handles is not None:  # delete tensors by handle
                 for handle in recv_handles:
                     if handle not in self._allocated_tensors:
                         logger.warning(
@@ -948,7 +1097,7 @@ class MemoryCache:
                     numel_pool = dtype_pool.setdefault(numel, [])
                     numel_pool.append(tensor)
                     dtype_pool.move_to_end(numel)  # Mark as recently used
-                    
+
                     # [IMPROVEMENT 1] Update LRU (refresh usage)
                     self._lru_keys[(descr.device, descr.dtype, numel)] = None
                     self._lru_keys.move_to_end((descr.device, descr.dtype, numel))
@@ -956,6 +1105,8 @@ class MemoryCache:
                     tensor_size = numel * get_size_in_bytes(descr.dtype)
                     with self._pooled_size_bytes.get_lock():
                         self._pooled_size_bytes.value += tensor_size
+
+                continue
 
         # Step 4: Yield tensors
         missing_handles = [h for h in handles if h not in self._allocated_tensors]
@@ -1017,7 +1168,7 @@ class MemoryCache:
             numel_pool = dtype_pool.setdefault(numel, [])
             numel_pool.append(tensor)
             dtype_pool.move_to_end(numel)
-            
+
             # [IMPROVEMENT 1] Update LRU
             self._lru_keys[(descr.device, descr.dtype, numel)] = None
             self._lru_keys.move_to_end((descr.device, descr.dtype, numel))
@@ -1045,11 +1196,11 @@ class MemoryCache:
                     dtype_pool = device_pool.setdefault(descr.dtype, OrderedDict())
                     numel_pool = dtype_pool.setdefault(tensor.numel(), [])
                     numel_pool.append(tensor)
-                    
+
                     # [IMPROVEMENT 1] Update LRU
                     self._lru_keys[(descr.device, descr.dtype, tensor.numel())] = None
                     self._lru_keys.move_to_end((descr.device, descr.dtype, tensor.numel()))
-                    
+
                 self._pre_allocation_timestamps.pop(session_id, None)
                 continue
 
@@ -1080,6 +1231,26 @@ class MemoryCache:
                 logger.info(f"Elevated memory pressure: {memory_pressure * 100:.1f}%")
 
             self._last_monitoring_log = current_time
+
+    def _check_stalled_evictions(self, timeout_seconds: float = 5.0) -> None:
+        """Log warnings for eviction requests that are taking too long.
+
+        :param timeout_seconds: Threshold in seconds before considering a request stalled
+        """
+        current_time = time.time()
+        stalled = []
+
+        for request_id, info in list(self._pending_evictions.items()):
+            age = current_time - info["timestamp"]
+            if age > timeout_seconds:
+                stalled.append((request_id, age, info["bytes_requested"]))
+
+        if stalled:
+            for request_id, age, bytes_req in stalled:
+                logger.warning(
+                    f"{self._log_prefix()} Stalled eviction request #{request_id}: "
+                    f"{bytes_req / 1024**2:.2f} MB pending for {age:.1f}s"
+                )
 
 
 class AllocationFailed(Exception):
