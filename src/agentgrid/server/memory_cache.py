@@ -22,7 +22,7 @@ import multiprocessing as mp
 import os
 import time
 from collections import OrderedDict
-from typing import AsyncContextManager, Counter, Dict, List, Optional, Sequence, Tuple
+from typing import AsyncContextManager, Counter, Dict, List, Optional, Sequence, Set, Tuple
 
 import async_timeout
 import torch
@@ -52,8 +52,19 @@ class MemoryCache:
         self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
         self._allocated_tensors: Dict[Handle, torch.Tensor] = {}
+        self._session_handles: Dict[str, Set[Handle]] = {}
+        
         # New free pools structure: {device: {dtype: OrderedDict(numel: [tensors])}}
         self._free_pools: Dict[torch.device, Dict[torch.dtype, "OrderedDict[int, List[torch.Tensor]]"]] = {}
+        
+        # Global LRU Tracking
+        # Tracks (device, dtype, numel) buckets in order of access
+        self._lru_keys: "OrderedDict[Tuple[torch.device, torch.dtype, int], None]" = OrderedDict()
+
+        # Smart Compaction Tracking
+        # Only compact into sizes that have actually been requested by the runtime
+        self._requested_sizes: Set[int] = set()
+
         self.runtime_pid = os.getpid()
 
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
@@ -133,10 +144,7 @@ class MemoryCache:
     @property
     def bytes_left(self) -> int:
         with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-            # Note: _pooled_size_bytes is NOT counted as "used" because those tensors are
-            # in the free pool and available for immediate reuse. Only active allocations
-            # (current_size_bytes) and pending allocations (enqueued_size_bytes) count as used.
-            total_used = self.current_size_bytes + self.enqueued_size_bytes
+            total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
             # Account for reserved overhead in the calculation
             return max(0, self.max_size_bytes - total_used - self._reserved_overhead_bytes)
 
@@ -173,12 +181,6 @@ class MemoryCache:
     def _get_cuda_memory_info(self, device: torch.device) -> Tuple[int, int]:
         """Get actual CUDA memory info (free, total) for a device."""
         if device.type == "cuda":
-            # Skip CUDA memory check if we're in the runtime subprocess (after fork)
-            # CUDA cannot be accessed after fork, but that's OK - the ConnectionHandler
-            # process does the actual CUDA memory checking for backpressure
-            if os.getpid() != self.runtime_pid:
-                return (2**64 - 1, 2**64 - 1)
-
             try:
                 free_bytes, total_bytes = torch.cuda.mem_get_info(device.index or 0)
                 self._cuda_memory_limits[device] = (free_bytes, total_bytes)
@@ -289,8 +291,7 @@ class MemoryCache:
             # Only clear device caches if we collected objects or being aggressive
             if collected > 0 or aggressive:
                 # Clear CUDA cache if available with device-specific clearing
-                # Skip if we're in the runtime subprocess (CUDA cannot be accessed after fork)
-                if torch.cuda.is_available() and os.getpid() == self.runtime_pid:
+                if torch.cuda.is_available():
                     # Clear cache for all CUDA devices
                     for device_id in range(torch.cuda.device_count()):
                         with torch.cuda.device(device_id):
@@ -340,10 +341,8 @@ class MemoryCache:
         :param required_bytes: Amount of memory needed for allocation
         :param device: Optional device to check memory for
         """
-        # Note: _pooled_size_bytes represents free pool tensors available for reuse,
-        # so it should NOT be counted as "used" for budget checking
-        with self._enqueued_size.get_lock():
-            total_used = self.current_size_bytes + self.enqueued_size_bytes
+        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+            total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
 
         # Check actual CUDA memory availability
         if device is not None and device.type == "cuda":
@@ -382,9 +381,8 @@ class MemoryCache:
                     self.force_garbage_collection()
 
             # Check if we still don't have enough memory after eviction
-            # Note: _pooled_size_bytes is not counted as used (tensors available for reuse)
-            with self._enqueued_size.get_lock():
-                total_used_after = self.current_size_bytes + self.enqueued_size_bytes
+            with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+                total_used_after = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
 
             if total_used_after + required_bytes > self.max_size_bytes:
                 logger.warning(f"Still insufficient memory after eviction: need {required_bytes / 1024**2:.2f} MB, available {(self.max_size_bytes - total_used_after) / 1024**2:.2f} MB")
@@ -509,16 +507,14 @@ class MemoryCache:
             context_manager = async_timeout.timeout(timeout) if timeout != 0 else contextlib.AsyncExitStack()
             # contextlib.AsyncExitStack() is used as a null context here
             async with context_manager:
-                # Note: _pooled_size_bytes represents free pool tensors available for reuse,
-                # so only count current_size_bytes (active allocations) and enqueued_size_bytes
-                with self._enqueued_size.get_lock():
-                    total_size = self.current_size_bytes + self.enqueued_size_bytes
+                with self._pooled_size_bytes.get_lock():
+                    total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
                 if timeout == 0 and total_size > self.max_size_bytes:
                     raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
 
                 async with enter_asynchronously(self._lock_acquire_memory):
-                    with self._enqueued_size.get_lock():
-                        current_total_size = self.current_size_bytes + self.enqueued_size_bytes
+                    with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+                        current_total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
                     if current_total_size + alloc_size > self.max_size_bytes:
                         if timeout == 0:
                             raise AllocationFailed(f"Could not allocate {alloc_size} bytes immediately: out of memory")
@@ -557,9 +553,8 @@ class MemoryCache:
         timeout = timeout if timeout != float("inf") else None
         deadline = None if timeout is None else time.perf_counter() + timeout
         while True:
-            # Note: _pooled_size_bytes is not counted as used (tensors available for reuse)
-            with self._enqueued_size.get_lock():
-                current_total_size = self.current_size_bytes + self.enqueued_size_bytes
+            with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+                current_total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
             if current_total_size + allocated_size <= self.max_size_bytes:
                 break
 
@@ -576,39 +571,59 @@ class MemoryCache:
             self._memory_freed_event.clear()
 
     def _evict_memory(self, bytes_to_free: int):
-        """Evicts tensors from free pools in LRU order until at least `bytes_to_free` are freed."""
+        """Evicts tensors from free pools in Global LRU order until at least `bytes_to_free` are freed."""
         bytes_freed = 0
-        devices = list(self._free_pools.keys())
-        for device in devices:
+        
+        # [IMPROVEMENT 1] Use global LRU keys to decide what to evict next
+        # Iterate over a copy because we might modify the map
+        for lru_key in list(self._lru_keys.keys()):
             if bytes_freed >= bytes_to_free:
                 break
-            dtypes = list(self._free_pools.get(device, {}).keys())
-            for dtype in dtypes:
-                if bytes_freed >= bytes_to_free:
-                    break
-                numels = list(self._free_pools[device].get(dtype, {}).keys())
-                for numel in numels:
-                    if bytes_freed >= bytes_to_free:
-                        break
-                    pool = self._free_pools[device][dtype][numel]
-                    while pool and bytes_freed < bytes_to_free:
-                        tensor = pool.pop()
-                        tensor_size = tensor.numel() * get_size_in_bytes(tensor.dtype)
-                        with self._pooled_size_bytes.get_lock():
-                            self._pooled_size_bytes.value -= tensor_size
-                        bytes_freed += tensor_size
-                        del tensor  # Let python GC reclaim memory
-                    if not pool:
-                        del self._free_pools[device][dtype][numel]
-
-                if not self._free_pools[device][dtype]:
-                    del self._free_pools[device][dtype]
-            if not self._free_pools[device]:
-                del self._free_pools[device]
+                
+            device, dtype, numel = lru_key
+            
+            # Check if this specific pool exists
+            device_pools = self._free_pools.get(device)
+            if not device_pools:
+                self._lru_keys.pop(lru_key, None)
+                continue
+                
+            dtype_pools = device_pools.get(dtype)
+            if not dtype_pools:
+                self._lru_keys.pop(lru_key, None)
+                continue
+                
+            pool = dtype_pools.get(numel)
+            if not pool:
+                self._lru_keys.pop(lru_key, None)
+                continue
+            
+            # Evict from this specific pool
+            # We pop multiple if needed, but at least one to make progress on this LRU bucket
+            while pool and bytes_freed < bytes_to_free:
+                tensor = pool.pop(0) # Pop from start (oldest in this bucket) or end? 
+                # Actually, pool is appended to. So pool.pop(0) is oldest.
+                # But wait, we usually use pop() (newest) for reuse. 
+                # For eviction, we want oldest. So pop(0).
+                
+                tensor_size = tensor.numel() * get_size_in_bytes(tensor.dtype)
+                with self._pooled_size_bytes.get_lock():
+                    self._pooled_size_bytes.value -= tensor_size
+                bytes_freed += tensor_size
+                del tensor  # Let python GC reclaim memory
+            
+            # If pool is now empty, remove it from structures
+            if not pool:
+                del dtype_pools[numel]
+                self._lru_keys.pop(lru_key, None) # Remove from LRU tracking
 
         if bytes_freed > 0:
             self._memory_freed_event.set()
             self._eviction_count += 1
+        
+        if bytes_freed < bytes_to_free:
+            logger.debug(f"Warning: requested to evict {bytes_to_free} bytes but could only evict {bytes_freed} bytes.")
+            
         logger.debug(f"Evicted {bytes_freed / 1024**2:.2f} MB from memory cache pools.")
 
     def _needs_compaction(self) -> bool:
@@ -640,9 +655,8 @@ class MemoryCache:
 
     def _get_memory_pressure(self) -> float:
         """Get current memory pressure as a ratio of used/max memory."""
-        # Note: _pooled_size_bytes is not counted as pressure (tensors available for reuse)
-        with self._enqueued_size.get_lock():
-            total_used = self.current_size_bytes + self.enqueued_size_bytes
+        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+            total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
         return total_used / self.max_size_bytes if self.max_size_bytes != 2**64 - 1 else 0.0
 
     def _calculate_adaptive_interval(self) -> int:
@@ -701,6 +715,15 @@ class MemoryCache:
                 # We iterate over a copy of keys since we might modify the dictionary
                 for numel, pool in list(dtype_pools.items()):
                     if len(pool) >= self.COMPACTION_THRESHOLD:
+                        
+                        # [IMPROVEMENT 2] Smart Compaction Check
+                        # Check if the target merged size (2 * numel) is actually useful
+                        target_size = 2 * numel
+                        if target_size not in self._requested_sizes:
+                            # Skip compacting this pool because the resulting tensors 
+                            # have never been requested by the model
+                            continue
+                            
                         logger.debug(
                             f"Compacting pool on {device}:{dtype} with {len(pool)} tensors of size {numel}"
                         )
@@ -726,6 +749,10 @@ class MemoryCache:
                             new_pool = dtype_pools.setdefault(new_numel, [])
                             new_pool.append(new_tensor)
                             dtype_pools.move_to_end(new_numel)
+                            
+                            # Update LRU for the new bucket
+                            self._lru_keys[(device, dtype, new_numel)] = None
+                            
                             compaction_work_done = True
                         
                         logger.debug(f"Compaction finished for pool. Size: {initial_pool_size} -> {len(pool)}")
@@ -788,9 +815,8 @@ class MemoryCache:
                 logger.debug(f"Periodic GC collected {collected} objects")
 
         # Step 2: Evict memory if cache is over budget
-        # Note: _pooled_size_bytes is not counted as "over budget" since those tensors are reusable
-        with self._enqueued_size.get_lock():
-            total_size = self.current_size_bytes + self.enqueued_size_bytes
+        with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
+            total_size = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
 
         if self.max_size_bytes == 2**64 - 1:
             should_evict = False
@@ -813,6 +839,34 @@ class MemoryCache:
                     patterns = self._session_patterns.setdefault(session_id, [])
                     patterns.append(history)
                     logger.debug(f"Ended session {session_id}, stored allocation pattern with {len(history)} steps.")
+                
+                # Clean up any active handles associated with this session to prevent leaks
+                if session_id in self._session_handles:
+                    session_handles = self._session_handles.pop(session_id)
+                    # Filter for handles that are still allocated
+                    handles_to_free = [h for h in session_handles if h in self._allocated_tensors]
+                    
+                    if handles_to_free:
+                        logger.debug(f"End session {session_id}: cleaning up {len(handles_to_free)} leaked handles")
+                        # Reuse the free logic
+                        for handle in handles_to_free:
+                            tensor = self._allocated_tensors.pop(handle)
+                            descr = TensorDescriptor.from_tensor(tensor)
+                            numel = tensor.numel()
+
+                            device_pool = self._free_pools.setdefault(descr.device, {})
+                            dtype_pool = device_pool.setdefault(descr.dtype, OrderedDict())
+                            numel_pool = dtype_pool.setdefault(numel, [])
+                            numel_pool.append(tensor)
+                            dtype_pool.move_to_end(numel)
+                            
+                            # [IMPROVEMENT 1] Update LRU
+                            self._lru_keys[(descr.device, descr.dtype, numel)] = None
+
+                            tensor_size = numel * get_size_in_bytes(descr.dtype)
+                            with self._pooled_size_bytes.get_lock():
+                                self._pooled_size_bytes.value += tensor_size
+
                 if session_id in self._pre_allocated_tensors: # Clean up any leftover pre-allocations
                     for tensor in self._pre_allocated_tensors.pop(session_id):
                         # Return tensor to the free pool
@@ -829,8 +883,13 @@ class MemoryCache:
                 if session_id:
                     session_history = self._active_sessions.setdefault(session_id, [])
                     session_history.extend(recv_data)
+                    # Track handles allocated for this session
+                    self._session_handles.setdefault(session_id, set()).update(recv_handles)
 
                 for handle, descr in zip(recv_handles, recv_data):
+                    # [IMPROVEMENT 2] Track requested sizes
+                    self._requested_sizes.add(descr.numel())
+                    
                     reused_tensor = None
                     numel = descr.numel()
 
@@ -854,6 +913,9 @@ class MemoryCache:
                             if dtype_pools and numel in dtype_pools and dtype_pools[numel]:
                                 reused_tensor = dtype_pools[numel].pop()
                                 dtype_pools.move_to_end(numel)
+                                
+                                # [IMPROVEMENT 1] Update LRU (refresh usage)
+                                self._lru_keys.move_to_end((descr.device, descr.dtype, numel))
 
                     if reused_tensor is not None:
                         self._allocated_tensors[handle] = reused_tensor.view(descr.shape)
@@ -861,9 +923,7 @@ class MemoryCache:
                         with self._pooled_size_bytes.get_lock():
                             self._pooled_size_bytes.value -= tensor_size
                     else:
-                        # Allocate new tensor - note: we can't check CUDA memory here because
-                        # this runs in the forked runtime subprocess where torch.cuda.mem_get_info() fails
-                        # The CUDA memory check is done in allocate_cache() (handler process) instead
+                        # Allocate new tensor
                         self._allocated_tensors[handle] = torch.empty(
                             descr.shape, dtype=descr.dtype, device=descr.device
                         )
@@ -888,6 +948,10 @@ class MemoryCache:
                     numel_pool = dtype_pool.setdefault(numel, [])
                     numel_pool.append(tensor)
                     dtype_pool.move_to_end(numel)  # Mark as recently used
+                    
+                    # [IMPROVEMENT 1] Update LRU (refresh usage)
+                    self._lru_keys[(descr.device, descr.dtype, numel)] = None
+                    self._lru_keys.move_to_end((descr.device, descr.dtype, numel))
 
                     tensor_size = numel * get_size_in_bytes(descr.dtype)
                     with self._pooled_size_bytes.get_lock():
@@ -953,6 +1017,11 @@ class MemoryCache:
             numel_pool = dtype_pool.setdefault(numel, [])
             numel_pool.append(tensor)
             dtype_pool.move_to_end(numel)
+            
+            # [IMPROVEMENT 1] Update LRU
+            self._lru_keys[(descr.device, descr.dtype, numel)] = None
+            self._lru_keys.move_to_end((descr.device, descr.dtype, numel))
+
             tensor_size = numel * get_size_in_bytes(descr.dtype)
             with self._pooled_size_bytes.get_lock():
                 self._pooled_size_bytes.value += tensor_size
@@ -976,6 +1045,11 @@ class MemoryCache:
                     dtype_pool = device_pool.setdefault(descr.dtype, OrderedDict())
                     numel_pool = dtype_pool.setdefault(tensor.numel(), [])
                     numel_pool.append(tensor)
+                    
+                    # [IMPROVEMENT 1] Update LRU
+                    self._lru_keys[(descr.device, descr.dtype, tensor.numel())] = None
+                    self._lru_keys.move_to_end((descr.device, descr.dtype, tensor.numel()))
+                    
                 self._pre_allocation_timestamps.pop(session_id, None)
                 continue
 
@@ -985,18 +1059,12 @@ class MemoryCache:
         if current_time - self._last_monitoring_log >= self._monitoring_interval:
             gib = 1024**3
             with self._pooled_size_bytes.get_lock(), self._enqueued_size.get_lock():
-                active_used = self.current_size_bytes
-                pooled_free = self._pooled_size_bytes.value
-                enqueued = self.enqueued_size_bytes
-                # Note: For memory pressure calculation, we only count active allocations
-                # since pooled tensors are available for immediate reuse
-                memory_pressure = active_used / self.max_size_bytes if self.max_size_bytes != 2**64 - 1 else 0.0
+                total_used = self.current_size_bytes + self._pooled_size_bytes.value + self.enqueued_size_bytes
+                memory_pressure = total_used / self.max_size_bytes if self.max_size_bytes != 2**64 - 1 else 0.0
 
             logger.info(
                 f"Memory Cache Stats - "
-                f"Active: {active_used / gib:.2f} GiB ({memory_pressure * 100:.1f}%), "
-                f"Pooled (reusable): {pooled_free / gib:.2f} GiB, "
-                f"Enqueued: {enqueued / gib:.2f} GiB, "
+                f"Used: {total_used / gib:.2f} GiB ({memory_pressure * 100:.1f}%), "
                 f"Available: {self.bytes_left / gib:.2f} GiB, "
                 f"Allocations: {self._allocation_count}, "
                 f"Evictions: {self._eviction_count}, "
