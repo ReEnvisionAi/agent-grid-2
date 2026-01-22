@@ -160,6 +160,7 @@ class TransformerConnectionHandler(ConnectionHandler):
             max_length = metadata.get("max_length")
             points = metadata.get("points", 0)
             session_id = metadata.get("session_id")
+            logger.debug(f"[INFERENCE_REQUEST_RECEIVED] session_id={session_id}, handler_index={self._handler_index}, max_length={max_length}")
             alloc_timeout = float(metadata.get("alloc_timeout", 0.0))
             args_structure = metadata.get("args_structure")
             if not requested_uids:
@@ -256,13 +257,26 @@ class TransformerConnectionHandler(ConnectionHandler):
                     raise e
 
         finally:
-            if session_id:
-                self.module_backends[requested_uids[0]].memory_cache.end_session(session_id)
+            # Signal the runtime that the session has ended.
+            # This must happen after allocate_cache's finally block has run (freeing handles),
+            # so that the runtime can properly clean up session state and store patterns.
+            if session_id is not None:
+                try:
+                    # Call end_session on the first backend's memory cache
+                    # This sends a command to the runtime via pipe
+                    requested_backends = tuple(self.module_backends.get(uid) for uid in requested_uids or [])
+                    if requested_backends:
+                        logger.debug(f"[Handler {self._handler_index}] Calling end_session for session_id={session_id}")
+                        requested_backends[0].memory_cache.end_session(session_id)
+                except Exception as e:
+                    # Log but don't fail the request if end_session fails
+                    logger.warning(f"Failed to call end_session for session {session_id}: {e}")
             self._log_request("rpc_inference.close", requested_uids, context)
 
     @contextlib.contextmanager
     def _managed_session(self, session_id: str):
         assert session_id not in self._session_queues, f"session id {session_id} is not unique"
+        logger.debug(f"[INFERENCE_SESSION_START] session_id={session_id}, handler_index={self._handler_index}")
         try:
             self._session_queues[session_id] = asyncio.Queue()
             self._session_handlers[session_id] = self._handler_index
@@ -271,11 +285,17 @@ class TransformerConnectionHandler(ConnectionHandler):
                     other_queue.put_nowait((Event.NEW_SESSION, session_id, self._handler_index))
             yield
         finally:
+            logger.info(f"[INFERENCE_SESSION_STOP] session_id={session_id}, handler_index={self._handler_index}")
+            logger.info(f"[CACHE_CLEARING_INITIATED] session_id={session_id}, handler_index={self._handler_index} - notifying all handlers to clear session state")
             self._session_queues.pop(session_id).put_nowait(None)  # put None so that the get task will not hang
             del self._session_handlers[session_id]
+            # Note: END_SESSION events are no longer needed here - end_session() is now properly
+            # called from rpc_inference's finally block, which communicates with the runtime
+            # to clean up session state and store allocation patterns.
             for other_index, other_queue in enumerate(self._handler_event_queues):
                 if other_index != self._handler_index:
                     other_queue.put_nowait((Event.END_SESSION, session_id, self._handler_index))
+            logger.debug(f"[CACHE_CLEARING_NOTIFICATIONS_SENT] session_id={session_id}, notified {len(self._handler_event_queues) - 1} other handlers")
 
     def _put_into_session_queue(self, session_id: str, request: runtime_pb2.ExpertRequest):
         handler_index = self._session_handlers.get(session_id)
