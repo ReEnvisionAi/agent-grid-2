@@ -512,8 +512,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         else:
             output_compression = tuple(tensor.compression for tensor in outputs_schema)
 
+        # Enforce float16 at the network boundary for cross-platform safety
         return [
-            serialize_torch_tensor(result.to(proto.dtype), compression, allow_inplace=True)
+            serialize_torch_tensor(result.to(torch.float16), compression, allow_inplace=True)
             for result, proto, compression in zip([hidden_states], outputs_schema, output_compression)
         ]
 

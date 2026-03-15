@@ -67,7 +67,8 @@ def load_pretrained_block(
             config._attn_implementation = "eager"
 
     assert torch_dtype in DTYPE_MAP.values(), f"torch_dtype must be one of {list(DTYPE_MAP.values())}"
-    torch_dtype = resolve_block_dtype(config, torch_dtype)
+    # Force float16 to ensure cross-platform network safety (bfloat16 crashes Apple Silicon nodes)
+    torch_dtype = torch.float16
 
     with init_empty_weights():
         block = get_model_block(config, layer_idx=block_index)

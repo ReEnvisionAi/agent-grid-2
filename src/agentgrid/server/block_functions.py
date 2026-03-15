@@ -50,8 +50,8 @@ def _prepare_prompts(prompts: torch.Tensor, requested_backends: Sequence[Transfo
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
 MAX_SHORT_INFERENCE_TOKENS = 128
-# Updated based on bitsandbytes 0.45.0+ performance improvements for NF4
-MAX_NF4_SHORT_INFERENCE_TOKENS = 128
+# Token threshold for 4-bit quantized inference merging (torchao int4_weight_only)
+MAX_INT4_SHORT_INFERENCE_TOKENS = 128
 
 logger = get_logger(__name__)
 
@@ -83,8 +83,8 @@ async def run_rpc_forward(
     position_embeddings = unpacked_args[4]
 
     dtype = requested_backends[0].dtype
-    # check parse input tensors and cast dtypes
-    hidden_states = hidden_states.to(dtype)
+    # Cast incoming tensors to float16 for cross-platform network safety, then to backend dtype
+    hidden_states = hidden_states.to(torch.float16).to(dtype)
     if hidden_states.ndim != 3:
         raise ValueError(f"Hidden states must be a 3D tensor, got shape {hidden_states.shape}")
     prompts = _prepare_prompts(prompts, requested_backends)
@@ -165,8 +165,8 @@ async def iterate_rpc_inference(
         position_embeddings = unpacked_args[4]
         batch_size, length_increment, _ = hidden_states.shape
 
-        # Cast inputs to backend dtype
-        hidden_states = hidden_states.to(requested_backends[0].dtype)
+        # Cast incoming tensors to float16 for cross-platform network safety, then to backend dtype
+        hidden_states = hidden_states.to(torch.float16).to(requested_backends[0].dtype)
 
         # parse deep prompts (optional argument)
         if prompts is None or is_dummy(prompts):
@@ -180,7 +180,7 @@ async def iterate_rpc_inference(
                 f" exceeds pre-allocated maximum {max_length}"
             )
 
-        merge_max_tokens = MAX_NF4_SHORT_INFERENCE_TOKENS if quant_type == QuantType.NF4 else MAX_SHORT_INFERENCE_TOKENS
+        merge_max_tokens = MAX_INT4_SHORT_INFERENCE_TOKENS if quant_type in (QuantType.NF4, QuantType.INT4_WEIGHT_ONLY) else MAX_SHORT_INFERENCE_TOKENS
         can_merge_pools = batch_size * length_increment <= merge_max_tokens
         priority = prioritizer.prioritize(
             hidden_states,
@@ -209,9 +209,9 @@ async def iterate_rpc_inference(
                         hidden_states, attention_mask, position_ids, position_embeddings, inference_infos, prompt, priority=priority
                     )
 
-        # serialize and send last layer outputs
+        # serialize and send last layer outputs, enforcing float16 at the network boundary
         output_tensors = [
-            serialize_torch_tensor(result.to(proto.dtype), proto.compression, allow_inplace=True)
+            serialize_torch_tensor(result.to(torch.float16), proto.compression, allow_inplace=True)
             for result, proto in zip((hidden_states,), nested_flatten(requested_backends[-1].outputs_schema))
         ]
         can_push = all(is_dummy(p) for p in prompts)

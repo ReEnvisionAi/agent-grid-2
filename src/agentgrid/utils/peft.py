@@ -13,14 +13,6 @@ import re
 import time
 from typing import List, Optional, Sequence, Union
 
-try:  # pragma: no cover - exercised only on platforms without bitsandbytes
-    import bitsandbytes as bnb
-except Exception as exc:  # noqa: BLE001 - we want the original exception chained for context
-    bnb = None  # type: ignore[assignment]
-    _BNB_IMPORT_ERROR: Optional[BaseException] = exc
-else:
-    _BNB_IMPORT_ERROR = None
-
 import torch
 import torch.nn as nn
 import transformers
@@ -40,15 +32,8 @@ from agentgrid.utils.misc import get_size_in_bytes
 
 logger = get_logger(__name__)
 
-if _BNB_IMPORT_ERROR is not None:
-    logger.debug("bitsandbytes import failed; quantized adapters will be unavailable: %s", _BNB_IMPORT_ERROR)
-
 
 _LORA_BASE_CLASSES = [lora.Linear]
-if hasattr(lora, "Linear8bitLt"):
-    _LORA_BASE_CLASSES.append(lora.Linear8bitLt)
-if hasattr(lora, "Linear4bit"):
-    _LORA_BASE_CLASSES.append(lora.Linear4bit)
 _LORA_CLASS_TUPLE = tuple(_LORA_BASE_CLASSES)
 
 
@@ -208,34 +193,8 @@ class LoraLinear(AdapterContextMixin, lora.Linear):
         self.is_target_conv_1d_layer = False
 
 
-if hasattr(lora, "Linear8bitLt") and bnb is not None:
-
-    class LoraLinear8bitLt(LoraLinear, lora.Linear8bitLt):
-        """LoRA linear 8-bit with outliers that uses adapter selected via using_adapter"""
-
-
-else:  # pragma: no cover - exercised when bitsandbytes / 8bit LoRA is unavailable
-
-    class LoraLinear8bitLt(LoraLinear):
-        """Fallback wrapper when 8-bit LoRA layers are unavailable"""
-
-        def __init__(self, base_layer, adapter_name: str):
-            super().__init__(base_layer, adapter_name)
-
-
-if hasattr(lora, "Linear4bit") and bnb is not None:
-
-    class LoraLinear4bit(LoraLinear, lora.Linear4bit):
-        """LoRA linear 4-bit that uses adapter selected via using_adapter"""
-
-
-else:  # pragma: no cover - exercised when bitsandbytes / 4bit LoRA is unavailable
-
-    class LoraLinear4bit(LoraLinear):
-        """Fallback wrapper when 4-bit LoRA layers are unavailable"""
-
-        def __init__(self, base_layer, adapter_name: str):
-            super().__init__(base_layer, adapter_name)
+# With torchao, quantized layers remain nn.Linear with quantized tensor subclasses,
+# so LoraLinear is sufficient for all cases. No bitsandbytes-specific wrappers needed.
 
 
 def create_lora_adapter(block):
@@ -243,15 +202,10 @@ def create_lora_adapter(block):
         if isinstance(module, LoraLinear):
             continue
         for child_name, child in module.named_children():
-            lora_class = None
+            # With torchao, quantized layers are still nn.Linear instances
+            # (with quantized tensor subclasses), so a single check suffices.
             if isinstance(child, nn.Linear):
-                lora_class = LoraLinear
-            elif bnb is not None and isinstance(child, bnb.nn.Linear8bitLt):
-                lora_class = LoraLinear8bitLt
-            elif bnb is not None and isinstance(child, bnb.nn.Linear4bit):
-                lora_class = LoraLinear4bit
-            if lora_class:
-                lora_wrapped_child = lora_class(
+                lora_wrapped_child = LoraLinear(
                     child,
                     AdapterContextMixin.ADAPTER_NOT_SET,
                 )

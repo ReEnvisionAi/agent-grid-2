@@ -163,7 +163,7 @@ class _ServerInferenceSession:
                 runtime_pb2.ExpertRequest(
                     uid=self.uid,
                     tensors=[
-                        serialize_torch_tensor(tensor.to(proto.dtype).cpu(), proto.compression)
+                        serialize_torch_tensor(tensor.to(torch.float16).cpu(), proto.compression)
                         for tensor, proto in zip(input_tensors, inference_schema)
                     ],
                     metadata=MSGPackSerializer.dumps(request_metadata),

@@ -92,7 +92,7 @@ inference = [
 ]
 gpu = [
     # GPU-only acceleration dependencies (Linux-supported)
-    "bitsandbytes==0.46.0; platform_system == 'Linux'",
+    "torchao>=0.4.0; platform_system == 'Linux'",
     "triton==3.2.0; platform_system == 'Linux'",
 ]
 macos = [

@@ -28,8 +28,10 @@ logger = get_logger(__name__)
 
 class QuantType(Enum):
     NONE = 0
-    INT8 = 1  # 8-bit as in the LLM.int8() paper
-    NF4 = 2  # 4-bit as in the QLoRA paper
+    INT8 = 1  # Deprecated alias for INT8_WEIGHT_ONLY
+    NF4 = 2  # Deprecated alias for INT4_WEIGHT_ONLY
+    INT8_WEIGHT_ONLY = 3  # 8-bit weight-only quantization via torchao
+    INT4_WEIGHT_ONLY = 4  # 4-bit weight-only quantization via torchao
 
 
 def convert_block(
@@ -91,14 +93,16 @@ def convert_block(
     block = make_tensor_parallel(block, config, tensor_parallel_devices, output_device=output_device)
 
     if quant_type != QuantType.NONE:
-        device_types = {device.type for device in tensor_parallel_devices}
-        if device_types != {"cuda"}:
-            raise ValueError(
-                f"{quant_type.name} quantization requires CUDA devices. "
-                "Re-run with --device cuda or disable quantization via --quant_type none. "
-                f"Detected device types: {sorted(device_types)}."
-            )
-        block = quantize_module(block, quant_type=quant_type)
+        normalized_qt = _normalize_quant_type(quant_type)
+        if normalized_qt != QuantType.NONE:
+            device_types = {device.type for device in tensor_parallel_devices}
+            if device_types != {"cuda"}:
+                raise ValueError(
+                    f"{quant_type.name} quantization requires CUDA devices. "
+                    "Re-run with --device cuda or disable quantization via --quantization none. "
+                    f"Detected device types: {sorted(device_types)}."
+                )
+            block = quantize_module(block, quant_type=quant_type)
 
     for shard, device in zip(block.module_shards, block.devices):
         shard.to(device)
@@ -120,52 +124,42 @@ def convert_block(
     return block
 
 
+def _normalize_quant_type(quant_type: QuantType) -> QuantType:
+    """Map deprecated aliases to their canonical torchao equivalents."""
+    if quant_type == QuantType.INT8:
+        return QuantType.INT8_WEIGHT_ONLY
+    if quant_type == QuantType.NF4:
+        return QuantType.INT4_WEIGHT_ONLY
+    return quant_type
+
+
 def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
-    # Import bitsandbytes only when necessary, so Agent Grid can run on platforms without CUDA support
+    """Apply torchao weight-only quantization to all Linear layers (except lm_head/score)."""
+    quant_type = _normalize_quant_type(quant_type)
+
     try:
-        import bitsandbytes as bnb
+        from torchao.quantization import quantize_, int4_weight_only, int8_weight_only
     except Exception as exc:  # pragma: no cover - depends on local environment
         raise RuntimeError(
-            "bitsandbytes is required for INT8/NF4 quantization. "
-            "Install a CUDA-enabled build (e.g. `pip install agent-grid[gpu]`) or disable quantization with --quant_type none. "
+            "torchao is required for quantization. "
+            "Install it (e.g. `pip install agent-grid[gpu]`) or disable quantization with --quantization none. "
             f"Original error: {exc}"
         ) from exc
 
-    for n, module in model.named_children():
-        if len(list(module.children())) > 0:
-            quantize_module(module, quant_type=quant_type)
+    def _filter_fn(module: nn.Module, fqn: str) -> bool:
+        """Only quantize nn.Linear layers, skip lm_head and score."""
+        if not isinstance(module, nn.Linear):
+            return False
+        name = fqn.rsplit(".", 1)[-1] if "." in fqn else fqn
+        return name not in ("lm_head", "score")
 
-        if isinstance(module, torch.nn.Linear) and n not in ["lm_head", "score"]:
-            assert module.weight.device.type == "cpu", f"expected linear layers on CPU, got {module.weight.device}"
-            if quant_type == QuantType.INT8:
-                model._modules[n] = bnb.nn.Linear8bitLt(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    has_fp16_weights=False,
-                    threshold=6.0,  # Default from the LLM.int8() paper
-                )
-                model._modules[n].weight = bnb.nn.Int8Params(
-                    module.weight.data, requires_grad=False, has_fp16_weights=False
-                ).to(module.weight.dtype)
-            elif quant_type == QuantType.NF4:
-                compress_statistics = True
-                model._modules[n] = bnb.nn.LinearNF4(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    compress_statistics=compress_statistics,
-                )
-                model._modules[n].weight = bnb.nn.Params4bit(
-                    module.weight.data,
-                    requires_grad=False,
-                    quant_type="nf4",
-                    blocksize=64,
-                    compress_statistics=compress_statistics,
-                ).to(module.weight.dtype)
-            else:
-                raise ValueError(f"Unsupported quant_type='{quant_type}'")
-            model._modules[n].bias = module.bias
+    if quant_type == QuantType.INT8_WEIGHT_ONLY:
+        quantize_(model, int8_weight_only(), filter_fn=_filter_fn)
+    elif quant_type == QuantType.INT4_WEIGHT_ONLY:
+        quantize_(model, int4_weight_only(group_size=128), filter_fn=_filter_fn)
+    else:
+        raise ValueError(f"Unsupported quant_type='{quant_type}'")
+
     return model
 
 
