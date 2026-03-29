@@ -73,12 +73,12 @@ dependencies = [
 [project.optional-dependencies]
 bootstrap = [
     "transformers[torch]==4.55.4", # if you change this, please also change version assert in agentgrid/__init__.py
-    "hivemind[cpu] @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.5",
+    "hivemind[cpu] @ file:./deps/hivemind-1.2.5-py3-none-any.whl",
 ]
 inference = [
     # Cross-platform inference dependencies
     "torch==2.6.0",
-    "hivemind @ git+https://github.com/ReEnvision-AI/hivemind.git@1.2.5",
+    "hivemind @ file:./deps/hivemind-1.2.5-py3-none-any.whl",
     "accelerate==1.7.0",
     "huggingface-hub==0.34.3",
     "tokenizers==0.21.2",
