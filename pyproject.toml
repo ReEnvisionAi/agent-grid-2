@@ -154,6 +154,8 @@ Changelog = "https://github.com/reenvision-ai/agent-grid/releases"
 agent-grid = "agentgrid.cli.run_server:main"
 agent-grid-bootstrap = "agentgrid.cli.run_dht:main"
 agent-grid-client = "agentgrid.cli.run_client:main"
+agent-grid-health = "agentgrid.cli.health_monitor:main"
+agent-grid-setup = "agentgrid.cli.setup_wizard:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
