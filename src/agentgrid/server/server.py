@@ -130,6 +130,7 @@ class Server:
         use_auto_relay: bool = True,
         adapters: Sequence[str] = (),
         warmup_tokens_interval: Optional[int] = None,
+        compile_block: bool = False,
         **kwargs,
     ):
         """Create a server with one or more bloom blocks. See run_server.py for documentation."""
@@ -218,7 +219,13 @@ class Server:
             device = torch.device(device.type, index=0)
         self.device = device
 
-        if self.device.type == "mps":
+        if self.device.type == "cuda":
+            from agentgrid.utils.device_utils import is_rocm, get_gpu_name
+            if is_rocm():
+                logger.info("Using AMD ROCm (HIP) backend: %s", get_gpu_name(device.index or 0))
+            else:
+                logger.info("Using NVIDIA CUDA backend: %s", get_gpu_name(device.index or 0))
+        elif self.device.type == "mps":
             logger.info("Using Apple Metal (MPS) backend")
             if hasattr(torch.backends, "mps"):
                 try:
@@ -228,7 +235,7 @@ class Server:
             torch.set_float32_matmul_precision("medium")
         elif self.device.type == "cpu":
             logger.info(
-                "Using CPU backend; throughput will be significantly lower than CUDA or MPS."
+                "Using CPU backend; throughput will be significantly lower than GPU."
             )
 
         torch_dtype = resolve_block_dtype(self.block_config, DTYPE_MAP[torch_dtype])
@@ -253,7 +260,7 @@ class Server:
             device_types = {dev.type for dev in self.tensor_parallel_devices}
             if device_types != {"cuda"}:
                 raise ValueError(
-                    "Tensor parallelism requires CUDA devices. "
+                    "Tensor parallelism requires GPU (CUDA/ROCm) devices. "
                     f"Detected device types: {sorted(device_types)}"
                 )
             logger.info(f"Model weights will be split between {', '.join(tensor_parallel_devices)}")
@@ -264,24 +271,24 @@ class Server:
 
         if quant_type is None:
             if device.type == "cuda" and tensor_parallel_device_types == {"cuda"}:
-                quant_type = QuantType.NF4
+                quant_type = QuantType.INT4_WEIGHT_ONLY
             else:
                 quant_type = QuantType.NONE
                 if device.type != "cuda":
                     logger.info(
-                        "Defaulting to --quant_type none for %s devices; CUDA is required for INT8/NF4 quantization.",
+                        "Defaulting to --quantization none for %s devices; GPU (CUDA/ROCm) is required for quantization.",
                         device.type.upper(),
                     )
                 elif tensor_parallel_device_types != {"cuda"}:
                     logger.info(
-                        "Defaulting to --quant_type none because tensor parallel devices include %s.",
+                        "Defaulting to --quantization none because tensor parallel devices include %s.",
                         sorted(tensor_parallel_device_types),
                     )
         else:
             if quant_type != QuantType.NONE and device.type != "cuda":
                 message = (
-                    f"{quant_type.name} quantization requires a CUDA device, but primary device is {device.type.upper()}. "
-                    "Defaulting to --quant_type none."
+                    f"{quant_type.name} quantization requires a GPU (CUDA/ROCm) device, but primary device is {device.type.upper()}. "
+                    "Defaulting to --quantization none."
                 )
                 if user_requested_quant_type:
                     logger.warning(message)
@@ -292,7 +299,7 @@ class Server:
                 message = (
                     f"{quant_type.name} quantization requires CUDA tensor-parallel devices, "
                     f"but detected {sorted(tensor_parallel_device_types)}. "
-                    "Defaulting to --quant_type none."
+                    "Defaulting to --quantization none."
                 )
                 if user_requested_quant_type:
                     logger.warning(message)
@@ -301,20 +308,21 @@ class Server:
                     raise ValueError(message)
 
         original_quant_type = quant_type
-        if quant_type == QuantType.NF4 and getattr(self.block_config, "model_type", None) == "gpt_oss":
+        if quant_type in (QuantType.NF4, QuantType.INT4_WEIGHT_ONLY) and getattr(self.block_config, "model_type", None) == "gpt_oss":
             logger.warning(
-                "NF4 quantization is not supported for GPT-OSS blocks; falling back to bfloat16 weights"
+                "4-bit quantization is not supported for GPT-OSS blocks; falling back to float16 weights"
             )
             quant_type = QuantType.NONE
             # For GPT-OSS with failed quantization, we need to account for higher memory usage
             self.gpt_oss_quantization_fallback = True
-            self.memory_overhead_multiplier = 4.0  # NF4->bfloat16 is 4x memory
+            self.memory_overhead_multiplier = 4.0  # 4bit->float16 is ~4x memory
         else:
             self.gpt_oss_quantization_fallback = False
             self.memory_overhead_multiplier = 1.0
 
         self.quant_type = quant_type
         self.original_requested_quant_type = original_quant_type
+        self.compile_block = compile_block
 
         logger.info(f"Model weights are loaded in {get_dtype_name(torch_dtype, quant_type)} format")
         if self.gpt_oss_quantization_fallback:
@@ -525,7 +533,7 @@ class Server:
         avg_block_size = self._get_avg_block_size_in_bytes()
         total_memory_per_block = avg_block_size + self._cache_bytes_per_block
         if self.adapters:
-            # Delay import of agentgrid.utils.peft to avoid unnecessary import of bitsandbytes
+            # Delay import of agentgrid.utils.peft to keep it optional
             from agentgrid.utils.peft import estimate_adapter_memory_per_block
 
             total_memory_per_block += estimate_adapter_memory_per_block(
@@ -629,6 +637,7 @@ class Server:
                     tensor_parallel_devices=self.tensor_parallel_devices,
                     should_validate_reachability=self.should_validate_reachability,
                     warmup_tokens_interval=self.warmup_tokens_interval,
+                    compile_block=self.compile_block,
                     gpt_oss_fallback=getattr(self, 'gpt_oss_quantization_fallback', False),
                     start=True,
                 )
@@ -758,6 +767,7 @@ class ModuleContainer(threading.Thread):
         tensor_parallel_devices: Sequence[torch.device],
         should_validate_reachability: bool,
         warmup_tokens_interval: Optional[int] = None,
+        compile_block: bool = False,
         gpt_oss_fallback: bool = False,
         **kwargs,
     ) -> ModuleContainer:
@@ -815,6 +825,27 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
+                # Conditionally apply torch.compile for GPU devices
+                if compile_block and torch.cuda.is_available() and device.type == "cuda":
+                    from agentgrid.utils.device_utils import is_rocm
+                    if is_rocm():
+                        logger.info(
+                            "AMD ROCm detected. Applying torch.compile(mode='reduce-overhead') to block %d...",
+                            block_index,
+                        )
+                        block = torch.compile(block, mode="reduce-overhead")
+                    else:
+                        logger.info(
+                            "CUDA detected. Applying torch.compile(mode='max-autotune') to block %d...",
+                            block_index,
+                        )
+                        block = torch.compile(block, mode="max-autotune")
+                elif compile_block and torch.backends.mps.is_available():
+                    logger.info(
+                        "Apple Silicon detected. Skipping torch.compile for block %d, using native MPS execution.",
+                        block_index,
+                    )
+
                 blocks[module_uid] = TransformerBackend(
                     module_uid,
                     block,

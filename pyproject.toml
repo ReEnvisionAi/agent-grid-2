@@ -92,8 +92,13 @@ inference = [
 ]
 gpu = [
     # GPU-only acceleration dependencies (Linux-supported)
-    "bitsandbytes==0.46.0; platform_system == 'Linux'",
+    "torchao>=0.4.0; platform_system == 'Linux'",
     "triton==3.2.0; platform_system == 'Linux'",
+]
+rocm = [
+    # AMD ROCm/HIP GPU acceleration (Linux-only; torch ROCm wheel installed separately)
+    "agent-grid[inference]",
+    "torchao>=0.4.0; platform_system == 'Linux'",
 ]
 macos = [
     # Convenience extra for Apple Silicon / Intel macOS hosts
@@ -154,6 +159,8 @@ Changelog = "https://github.com/reenvision-ai/agent-grid/releases"
 agent-grid = "agentgrid.cli.run_server:main"
 agent-grid-bootstrap = "agentgrid.cli.run_dht:main"
 agent-grid-client = "agentgrid.cli.run_client:main"
+agent-grid-health = "agentgrid.cli.health_monitor:main"
+agent-grid-setup = "agentgrid.cli.setup_wizard:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

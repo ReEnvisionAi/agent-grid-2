@@ -103,11 +103,11 @@ async def run_remote_forward(
     # TODO: create more explicit way to check servers schema and client's structure
     assert len(inputs) >= len(args_schema) + 1, "Inputs and prompt tensors are necessary for a forward step"
 
-    # Asynchronous serialization
+    # Asynchronous serialization - enforce float16 at network boundary
     loop = asyncio.get_running_loop()
     serialized_tensors = await asyncio.gather(
         *(
-            loop.run_in_executor(None, serialize_torch_tensor, tensor.to(proto.dtype), proto.compression)
+            loop.run_in_executor(None, serialize_torch_tensor, tensor.to(torch.float16), proto.compression)
             for tensor, proto in zip(inputs, forward_schema)
         )
     )
@@ -143,11 +143,11 @@ async def run_remote_backward(
         len(inputs_and_grad_outputs) >= len(args_schema) + len(outputs_schema) + 1
     ), "Inputs, grad_outputs and prompt tensors are necessary for a backward step"
 
-    # Asynchronous serialization
+    # Asynchronous serialization - enforce float16 at network boundary
     loop = asyncio.get_running_loop()
     serialized_tensors = await asyncio.gather(
         *(
-            loop.run_in_executor(None, serialize_torch_tensor, tensor.to(proto.dtype), proto.compression)
+            loop.run_in_executor(None, serialize_torch_tensor, tensor.to(torch.float16), proto.compression)
             for tensor, proto in zip(inputs_and_grad_outputs, backward_schema)
         )
     )

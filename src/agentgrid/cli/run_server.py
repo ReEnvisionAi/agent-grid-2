@@ -149,10 +149,17 @@ def main():
     parser.add_argument("--mean_balance_check_period", type=float, default=60,
                         help="Check the swarm's balance every N seconds (and rebalance it if necessary)")
 
-    parser.add_argument('--quant_type', type=str, default=None, choices=[choice.name.lower() for choice in QuantType],
-                        help="Quantize blocks to 8-bit (int8 from the LLM.int8() paper) or "
-                             "4-bit (nf4 from the QLoRA paper) formats to save GPU memory. "
-                             "Default: 'int8' if GPU is available, 'none' otherwise")
+    parser.add_argument('--quantization', type=str, default=None,
+                        choices=["none", "int4_weight_only", "int8_weight_only"],
+                        help="Quantize blocks using torchao weight-only quantization to save GPU memory. "
+                             "Choices: none, int4_weight_only (4-bit), int8_weight_only (8-bit). "
+                             "Default: 'int4_weight_only' if GPU is available, 'none' otherwise")
+    parser.add_argument('--quant_type', type=str, default=None,
+                        choices=[choice.name.lower() for choice in QuantType],
+                        help="[DEPRECATED] Use --quantization instead. Kept for backward compatibility.")
+    parser.add_argument('--compile-block', action='store_true', default=False,
+                        help="Enable torch.compile(mode='max-autotune') on transformer blocks. "
+                             "Only effective on CUDA devices; MPS is skipped automatically.")
     parser.add_argument("--tensor_parallel_devices", nargs='+', default=None,
                         help=
                         "Split each block between the specified GPUs such that each device holds a portion of every "
@@ -180,6 +187,31 @@ def main():
         args["converted_model_name_or_path"] = args.pop("model")
     else:
         args.pop("model", None)
+
+    # Map --quantization / --quant_type to a unified QuantType value
+    _QUANTIZATION_MAP = {
+        "none": "none",
+        "int4_weight_only": "int4_weight_only",
+        "int8_weight_only": "int8_weight_only",
+        # Legacy aliases from old --quant_type
+        "int8": "int8_weight_only",
+        "nf4": "int4_weight_only",
+    }
+    quantization = args.pop("quantization", None)
+    quant_type_legacy = args.pop("quant_type", None)
+    if quantization is not None and quant_type_legacy is not None:
+        raise ValueError("Cannot specify both --quantization and --quant_type. Use --quantization.")
+    raw_quant = quantization or quant_type_legacy  # may be None (auto-detect in server)
+    if raw_quant is not None:
+        mapped = _QUANTIZATION_MAP.get(raw_quant)
+        if mapped is None:
+            raise ValueError(f"Unknown quantization value: {raw_quant}")
+        args["quant_type"] = mapped
+    else:
+        args["quant_type"] = None
+
+    # Normalize compile-block key (argparse stores as 'compile_block' due to dash)
+    args["compile_block"] = args.pop("compile_block", False)
 
     validate_version()
 

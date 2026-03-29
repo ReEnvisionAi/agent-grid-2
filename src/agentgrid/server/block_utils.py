@@ -24,13 +24,11 @@ from agentgrid.utils.misc import get_size_in_bytes
 
 
 def resolve_block_dtype(config: PretrainedConfig, dtype: Union[str, torch.dtype]) -> torch.dtype:
-    """If dtype is "auto", resolves it using BloomConfig. Returns `dtype` intact otherwise."""
+    """If dtype is "auto", resolves it to float16 for cross-platform network safety. Returns `dtype` intact otherwise."""
     if dtype not in ("auto", None):
         return dtype
-    if config.torch_dtype not in ("auto", None, torch.float32):
-        # If config specifies float32, we override it to the default dtype below
-        return config.torch_dtype
-    return torch.bfloat16
+    # Default to float16 for cross-platform compatibility (bfloat16 crashes Apple Silicon nodes)
+    return torch.float16
 
 
 def get_block_size(
@@ -55,10 +53,10 @@ def get_block_size(
         if quant_type == QuantType.NONE:
             dtype = resolve_block_dtype(config, dtype)
             bytes_per_value = get_size_in_bytes(dtype)
-        elif quant_type == QuantType.INT8:
+        elif quant_type in (QuantType.INT8, QuantType.INT8_WEIGHT_ONLY):
             bytes_per_value = 1
-        elif quant_type == QuantType.NF4:
-            bytes_per_value = 4.25 / 8  # Bitness of NF4 with this config (measured empirically)
+        elif quant_type in (QuantType.NF4, QuantType.INT4_WEIGHT_ONLY):
+            bytes_per_value = 4.25 / 8  # ~0.53 bytes per value for 4-bit weight-only quantization
         else:
             raise ValueError(f"Unsupported quant_type={quant_type}")
     elif location == "disk":
