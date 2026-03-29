@@ -25,18 +25,28 @@ def _detect_hardware():
     dtype = "float32"
     quant = "none"
     gpu_name = None
+    is_rocm = False
 
     try:
         import torch
 
         if torch.cuda.is_available():
             device = "cuda"
-            dtype = "float16"
-            quant = "int4_weight_only"
+            is_rocm = getattr(torch.version, "hip", None) is not None
             try:
                 gpu_name = torch.cuda.get_device_name(0)
             except Exception:
-                gpu_name = "CUDA GPU"
+                gpu_name = "ROCm GPU" if is_rocm else "CUDA GPU"
+
+            if is_rocm:
+                # ROCm/AMD: float16 is safest across RDNA architectures
+                dtype = "float16"
+                quant = "int4_weight_only"
+                gpu_name = f"{gpu_name} (ROCm/HIP)"
+            else:
+                # NVIDIA CUDA
+                dtype = "float16"
+                quant = "int4_weight_only"
         elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
             device = "mps"
             dtype = "float16"

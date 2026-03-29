@@ -67,7 +67,9 @@ def list_models(models_file: Path | str) -> List[str]:
 
 
 def probe_devices() -> Dict[str, Dict[str, bool | int]]:
-    """Return a summary of available compute backends (CUDA, MPS, CPU)."""
+    """Return a summary of available compute backends (CUDA, ROCm, MPS, CPU)."""
+
+    from agentgrid.utils.device_utils import is_rocm
 
     info: Dict[str, Dict[str, bool | int]] = {
         "cuda": {
@@ -86,6 +88,18 @@ def probe_devices() -> Dict[str, Dict[str, bool | int]]:
             name = torch.cuda.get_device_name(idx)
             devices.append({"id": idx, "name": name})
         info["cuda"]["devices"] = devices  # type: ignore[index]
+
+    # Add ROCm-specific metadata when running on AMD HIP
+    if torch.cuda.is_available() and is_rocm():
+        info["rocm"] = {
+            "available": True,
+            "hip_version": getattr(torch.version, "hip", "unknown"),
+            "backend": "HIP",
+        }
+        # Relabel the backend so callers know this is ROCm, not NVIDIA CUDA
+        info["cuda"]["backend"] = "ROCm (HIP)"  # type: ignore[index]
+    elif torch.cuda.is_available():
+        info["cuda"]["backend"] = "NVIDIA CUDA"  # type: ignore[index]
 
     return info
 

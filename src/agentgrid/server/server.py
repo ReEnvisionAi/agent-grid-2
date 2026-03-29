@@ -219,7 +219,13 @@ class Server:
             device = torch.device(device.type, index=0)
         self.device = device
 
-        if self.device.type == "mps":
+        if self.device.type == "cuda":
+            from agentgrid.utils.device_utils import is_rocm, get_gpu_name
+            if is_rocm():
+                logger.info("Using AMD ROCm (HIP) backend: %s", get_gpu_name(device.index or 0))
+            else:
+                logger.info("Using NVIDIA CUDA backend: %s", get_gpu_name(device.index or 0))
+        elif self.device.type == "mps":
             logger.info("Using Apple Metal (MPS) backend")
             if hasattr(torch.backends, "mps"):
                 try:
@@ -229,7 +235,7 @@ class Server:
             torch.set_float32_matmul_precision("medium")
         elif self.device.type == "cpu":
             logger.info(
-                "Using CPU backend; throughput will be significantly lower than CUDA or MPS."
+                "Using CPU backend; throughput will be significantly lower than GPU."
             )
 
         torch_dtype = resolve_block_dtype(self.block_config, DTYPE_MAP[torch_dtype])
@@ -254,7 +260,7 @@ class Server:
             device_types = {dev.type for dev in self.tensor_parallel_devices}
             if device_types != {"cuda"}:
                 raise ValueError(
-                    "Tensor parallelism requires CUDA devices. "
+                    "Tensor parallelism requires GPU (CUDA/ROCm) devices. "
                     f"Detected device types: {sorted(device_types)}"
                 )
             logger.info(f"Model weights will be split between {', '.join(tensor_parallel_devices)}")
@@ -270,7 +276,7 @@ class Server:
                 quant_type = QuantType.NONE
                 if device.type != "cuda":
                     logger.info(
-                        "Defaulting to --quantization none for %s devices; CUDA is required for quantization.",
+                        "Defaulting to --quantization none for %s devices; GPU (CUDA/ROCm) is required for quantization.",
                         device.type.upper(),
                     )
                 elif tensor_parallel_device_types != {"cuda"}:
@@ -281,7 +287,7 @@ class Server:
         else:
             if quant_type != QuantType.NONE and device.type != "cuda":
                 message = (
-                    f"{quant_type.name} quantization requires a CUDA device, but primary device is {device.type.upper()}. "
+                    f"{quant_type.name} quantization requires a GPU (CUDA/ROCm) device, but primary device is {device.type.upper()}. "
                     "Defaulting to --quantization none."
                 )
                 if user_requested_quant_type:
@@ -819,13 +825,21 @@ class ModuleContainer(threading.Thread):
                     cache_dir=cache_dir,
                     max_disk_space=max_disk_space,
                 )
-                # Conditionally apply torch.compile for CUDA devices
+                # Conditionally apply torch.compile for GPU devices
                 if compile_block and torch.cuda.is_available() and device.type == "cuda":
-                    logger.info(
-                        "CUDA detected. Applying torch.compile(mode='max-autotune') to block %d...",
-                        block_index,
-                    )
-                    block = torch.compile(block, mode="max-autotune")
+                    from agentgrid.utils.device_utils import is_rocm
+                    if is_rocm():
+                        logger.info(
+                            "AMD ROCm detected. Applying torch.compile(mode='reduce-overhead') to block %d...",
+                            block_index,
+                        )
+                        block = torch.compile(block, mode="reduce-overhead")
+                    else:
+                        logger.info(
+                            "CUDA detected. Applying torch.compile(mode='max-autotune') to block %d...",
+                            block_index,
+                        )
+                        block = torch.compile(block, mode="max-autotune")
                 elif compile_block and torch.backends.mps.is_available():
                     logger.info(
                         "Apple Silicon detected. Skipping torch.compile for block %d, using native MPS execution.",

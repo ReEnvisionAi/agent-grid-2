@@ -79,7 +79,7 @@ def convert_block(
         unique_types = {device.type for device in tensor_parallel_devices}
         if unique_types != {"cuda"}:
             raise ValueError(
-                "Tensor parallelism currently supports CUDA devices only. "
+                "Tensor parallelism currently supports GPU (CUDA/ROCm) devices only. "
                 f"Detected device types: {sorted(unique_types)}"
             )
 
@@ -98,7 +98,7 @@ def convert_block(
             device_types = {device.type for device in tensor_parallel_devices}
             if device_types != {"cuda"}:
                 raise ValueError(
-                    f"{quant_type.name} quantization requires CUDA devices. "
+                    f"{quant_type.name} quantization requires GPU (CUDA/ROCm) devices. "
                     "Re-run with --device cuda or disable quantization via --quantization none. "
                     f"Detected device types: {sorted(device_types)}."
                 )
@@ -142,7 +142,8 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
     except Exception as exc:  # pragma: no cover - depends on local environment
         raise RuntimeError(
             "torchao is required for quantization. "
-            "Install it (e.g. `pip install agent-grid[gpu]`) or disable quantization with --quantization none. "
+            "Install it (e.g. `pip install agent-grid[gpu]` or `pip install agent-grid[rocm]`) "
+            "or disable quantization with --quantization none. "
             f"Original error: {exc}"
         ) from exc
 

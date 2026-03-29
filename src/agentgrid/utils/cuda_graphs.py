@@ -11,9 +11,18 @@
 import torch
 from torch.utils._pytree import tree_flatten as _tree_flatten, tree_unflatten as _tree_unflatten
 
+from agentgrid.utils.device_utils import supports_cuda_graphs
+
 
 def make_inference_graphed_callable(callable: callable, sample_args, num_warmup_iters=3):
-    """Similar to torch.cuda.make_graphed_callables, but takes only one function and does not build a graph for the backward pass"""
+    """Similar to torch.cuda.make_graphed_callables, but takes only one function and does not build a graph for the backward pass.
+
+    On ROCm (HIP) or when ``AGENTGRID_DISABLE_CUDA_GRAPHS=1`` is set, falls back
+    to returning the callable directly without graph capture.
+    """
+    if not supports_cuda_graphs():
+        return callable
+
     assert not isinstance(callable, torch.nn.Module)
     if torch.is_autocast_enabled() and torch.is_autocast_cache_enabled():
         raise RuntimeError(
@@ -29,22 +38,30 @@ def make_inference_graphed_callable(callable: callable, sample_args, num_warmup_
     len_user_args = len(sample_args)
     static_input_surface = flatten_sample_args
 
-    graph = torch.cuda.CUDAGraph()
+    try:
+        graph = torch.cuda.CUDAGraph()
+    except Exception:
+        # Graph creation failed (e.g. unsupported ROCm architecture) — run eagerly.
+        return callable
 
     # Warmup
     # Hopefully prevents cudnn benchmarking and other lazy-initialization cuda work
     # from ending up in any captures.
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        for _ in range(num_warmup_iters):
-            outputs, _ = _tree_flatten(callable(*sample_args))
-        del outputs
-    torch.cuda.current_stream().wait_stream(s)
+    try:
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(num_warmup_iters):
+                outputs, _ = _tree_flatten(callable(*sample_args))
+            del outputs
+        torch.cuda.current_stream().wait_stream(s)
 
-    # Capture forward graph
-    with torch.cuda.graph(graph):
-        outputs = callable(*sample_args)
+        # Capture forward graph
+        with torch.cuda.graph(graph):
+            outputs = callable(*sample_args)
+    except Exception:
+        # Graph capture failed at runtime — fall back to eager execution.
+        return callable
 
     flatten_outputs, output_unflatten_spec = _tree_flatten(outputs)
     static_outputs = tuple(flatten_outputs)

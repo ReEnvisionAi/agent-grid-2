@@ -101,18 +101,27 @@ DETECTED_SETTINGS=$("$PYTHON_BIN" -c 'import torch
 device = "cpu"
 dtype = "float32"
 quant = "none"
+backend = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
-    dtype = "bfloat16"
-    quant = "nf4"
+    is_rocm = getattr(torch.version, "hip", None) is not None
+    if is_rocm:
+        dtype = "float16"
+        quant = "int4_weight_only"
+        backend = "rocm"
+    else:
+        dtype = "float16"
+        quant = "int4_weight_only"
+        backend = "cuda"
 elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
     device = "mps"
     dtype = "float16"
     quant = "none"
-print(device, dtype, quant)
+    backend = "mps"
+print(device, dtype, quant, backend)
 ' 2>/dev/null) || true
 
-read -r DETECTED_DEVICE DETECTED_DTYPE DETECTED_QUANT <<<"${DETECTED_SETTINGS:-cpu float32 none}"
+read -r DETECTED_DEVICE DETECTED_DTYPE DETECTED_QUANT DETECTED_BACKEND <<<"${DETECTED_SETTINGS:-cpu float32 none cpu}"
 
 DEVICE=${AG_DEVICE:-$DETECTED_DEVICE}
 TORCH_DTYPE=${AG_TORCH_DTYPE:-$DETECTED_DTYPE}
@@ -123,7 +132,11 @@ if [ "$DEVICE" != "cuda" ]; then
     QUANT_TYPE="none"
 fi
 
-echo "Using device=$DEVICE, torch_dtype=$TORCH_DTYPE, quant_type=$QUANT_TYPE"
+if [ "$DETECTED_BACKEND" = "rocm" ]; then
+    echo "Using AMD ROCm (HIP) backend: device=$DEVICE, torch_dtype=$TORCH_DTYPE, quant_type=$QUANT_TYPE"
+else
+    echo "Using device=$DEVICE, torch_dtype=$TORCH_DTYPE, quant_type=$QUANT_TYPE"
+fi
 
 CMD=(
     "$PYTHON_BIN" -m agentgrid.cli.run_server
