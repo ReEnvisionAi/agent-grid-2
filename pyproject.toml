@@ -93,13 +93,13 @@ inference = [
 ]
 gpu = [
     # GPU-only acceleration dependencies (Linux-supported)
-    "torchao>=0.4.0; platform_system == 'Linux'",
+    "torchao>=0.4.0,<0.9.0; platform_system == 'Linux'",
     "triton==3.2.0; platform_system == 'Linux'",
 ]
 rocm = [
     # AMD ROCm/HIP GPU acceleration (Linux-only; torch ROCm wheel installed separately)
     "agent-grid[inference]",
-    "torchao>=0.4.0; platform_system == 'Linux'",
+    "torchao>=0.4.0,<0.9.0; platform_system == 'Linux'",
 ]
 macos = [
     # Convenience extra for Apple Silicon / Intel macOS hosts
