@@ -67,6 +67,7 @@ dependencies = [
     "async-timeout==5.0.1",
     "humanfriendly==10.0",
     "environs==14.1.1",
+    "transformers==4.55.4",  # pinned here to prevent tensor_parallel's loose >=4.20.1 from pulling 5.x
     "tensor_parallel==2.0.0",
 ]
 
